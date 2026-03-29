@@ -1,0 +1,4 @@
+backend/data/db/
+backend/data/configs/
+backend/uvicorn.stdout.log
+backend/uvicorn.stderr.log
