@@ -1,23 +1,26 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-from datetime import datetime, timezone
 from collections.abc import Callable
+from datetime import datetime, timezone
 import json
+import logging
 import re
 from typing import Any
 
 from app.core.cvp_connector import CVPConnector
 from app.core.path_config import get_field_mapping, get_telemetry_paths
-from app.core.settings import Settings
+from app.core.settings import CVPSourceEndpoint, Settings
 from app.services.config_parser import extract_ip_records, reconstruct_config_lines
 
 
 VALUE_RE = re.compile(r'"value"\s*:\s*"?([^"}]+)"?')
+logger = logging.getLogger(__name__)
 
 
 class CVPCollectorSuite:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, source: CVPSourceEndpoint) -> None:
         self.settings = settings
+        self.source = source
         self.paths = get_telemetry_paths()
         self.fields = get_field_mapping()
 
@@ -25,10 +28,11 @@ class CVPCollectorSuite:
         timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')
         if progress_callback:
             progress_callback({'progress_percent': 5, 'step': 'connect', 'detail': 'Opening the CVP session.'})
+
         connector = CVPConnector(
             library_root=self.settings.cvp_library_root,
-            host=self.settings.cvp_hostname,
-            port=self.settings.cvp_resolved_port,
+            host=self.source.host,
+            port=self.source.port,
             token=self.settings.cvp_token,
             username=self.settings.cvp_username,
             password=self.settings.cvp_password,
@@ -40,15 +44,29 @@ class CVPCollectorSuite:
 
         with connector:
             if progress_callback:
-                progress_callback({'progress_percent': 10, 'step': 'device_inventory', 'detail': 'Loading the analytics device inventory.'})
+                progress_callback(
+                    {
+                        'progress_percent': 10,
+                        'step': 'device_inventory',
+                        'detail': 'Loading the analytics device inventory.',
+                    }
+                )
             devices = self._collect_devices(connector, timestamp)
             target_ids = self.settings.cvp_device_ids or list(devices)
             total_devices = max(len(target_ids), 1)
+            logger.info(
+                "Device inventory loaded. source=%s discovered_devices=%s target_devices=%s filtered=%s",
+                self.source.name,
+                len(devices),
+                len(target_ids),
+                bool(self.settings.cvp_device_ids),
+            )
 
             snapshot_devices: list[dict[str, Any]] = []
             vrfs: list[dict[str, Any]] = []
             bgp: list[dict[str, Any]] = []
             vlans: list[dict[str, Any]] = []
+            vnis: list[dict[str, Any]] = []
             configs: list[dict[str, Any]] = []
             ip_records: list[dict[str, Any]] = []
 
@@ -62,6 +80,7 @@ class CVPCollectorSuite:
                         'mgmt_ip': '',
                         'model': '',
                         'site': '',
+                        'cvp_source': self.source.name,
                         'tags': [],
                         'last_collected_at': timestamp,
                     },
@@ -76,7 +95,23 @@ class CVPCollectorSuite:
                             'detail': f"Collecting data for {device['hostname']} ({index}/{total_devices}).",
                         }
                     )
+                logger.info(
+                    "Collecting device %s/%s: source=%s hostname=%s device_id=%s",
+                    index,
+                    total_devices,
+                    self.source.name,
+                    device['hostname'],
+                    device_id,
+                )
 
+                if progress_callback:
+                    progress_callback(
+                        {
+                            'progress_percent': percent,
+                            'step': 'vrf',
+                            'detail': f"Loading VRFs for {device['hostname']} ({index}/{total_devices}).",
+                        }
+                    )
                 device_vrfs = self._collect_vrfs(connector, device_id, device)
                 if not device_vrfs:
                     device_vrfs = [
@@ -85,13 +120,49 @@ class CVPCollectorSuite:
                             'hostname': device['hostname'],
                             'vrf_name': 'default',
                             'vrf_id': '0',
+                            'cvp_source': self.source.name,
                         },
                     ]
                 vrfs.extend(device_vrfs)
 
+                if progress_callback:
+                    progress_callback(
+                        {
+                            'progress_percent': percent,
+                            'step': 'bgp',
+                            'detail': f"Loading BGP data for {device['hostname']} ({index}/{total_devices}).",
+                        }
+                    )
                 bgp.extend(self._collect_bgp(connector, device_id, device, device_vrfs))
+
+                if progress_callback:
+                    progress_callback(
+                        {
+                            'progress_percent': percent,
+                            'step': 'vlan',
+                            'detail': f"Loading VLAN data for {device['hostname']} ({index}/{total_devices}).",
+                        }
+                    )
                 vlans.extend(self._collect_vlans(connector, device_id, device))
 
+                if progress_callback:
+                    progress_callback(
+                        {
+                            'progress_percent': percent,
+                            'step': 'vni',
+                            'detail': f"Loading VxLAN VNI data for {device['hostname']} ({index}/{total_devices}).",
+                        }
+                    )
+                vnis.extend(self._collect_vnis(connector, device_id, device))
+
+                if progress_callback:
+                    progress_callback(
+                        {
+                            'progress_percent': percent,
+                            'step': 'config',
+                            'detail': f"Loading running-config for {device['hostname']} ({index}/{total_devices}).",
+                        }
+                    )
                 config_text = self._collect_config(connector, device_id)
                 if config_text:
                     configs.append(
@@ -100,9 +171,26 @@ class CVPCollectorSuite:
                             'hostname': device['hostname'],
                             'collected_at': timestamp,
                             'config_text': config_text,
+                            'cvp_source': self.source.name,
                         }
                     )
-                    ip_records.extend(extract_ip_records(device_id, device['hostname'], config_text))
+                    device_ip_records = extract_ip_records(device_id, device['hostname'], config_text)
+                    for item in device_ip_records:
+                        item['cvp_source'] = self.source.name
+                    ip_records.extend(device_ip_records)
+
+                logger.info(
+                    "Completed device %s/%s: source=%s hostname=%s vrfs=%s bgp=%s vlans=%s vnis=%s config=%s",
+                    index,
+                    total_devices,
+                    self.source.name,
+                    device['hostname'],
+                    len(device_vrfs),
+                    len([entry for entry in bgp if entry['device_id'] == device_id]),
+                    len([entry for entry in vlans if entry['device_id'] == device_id]),
+                    len([entry for entry in vnis if entry['device_id'] == device_id]),
+                    'yes' if config_text else 'no',
+                )
 
         if progress_callback:
             progress_callback({'progress_percent': 78, 'step': 'snapshot_ready', 'detail': 'Normalizing the collected data.'})
@@ -111,6 +199,7 @@ class CVPCollectorSuite:
             'bgp': bgp,
             'vrfs': vrfs,
             'vlans': vlans,
+            'vnis': vnis,
             'ip_records': ip_records,
             'configs': configs,
         }
@@ -129,6 +218,7 @@ class CVPCollectorSuite:
                 'mgmt_ip': raw.get('primaryManagementIP', ''),
                 'model': raw.get('modelName', ''),
                 'site': raw.get('containerName', ''),
+                'cvp_source': self.source.name,
                 'tags': [],
                 'last_collected_at': timestamp,
             }
@@ -153,6 +243,7 @@ class CVPCollectorSuite:
                     'hostname': device['hostname'],
                     'vrf_name': str(vrf_name),
                     'vrf_id': self._extract_scalar_from_key(raw_key),
+                    'cvp_source': self.source.name,
                 }
             )
         return vrfs
@@ -190,6 +281,7 @@ class CVPCollectorSuite:
                     'router_id': str(updates.get(self.fields['bgp']['router_id_field'], '')),
                     'shutdown': bool(updates.get(self.fields['bgp']['shutdown_field'], False)),
                     'source_path': '/' + '/'.join(str(item) for item in path),
+                    'cvp_source': self.source.name,
                 }
             )
         return [entry for entry in entries if entry['asn']]
@@ -244,9 +336,59 @@ class CVPCollectorSuite:
                     'svi_name': svi_name if svi_name in svi_descriptions else 'X',
                     'description': description,
                     'source_path': '/' + '/'.join(self.paths['vlan']['config_path']),
+                    'cvp_source': self.source.name,
                 }
             )
         return vlans
+
+    def _collect_vnis(
+        self,
+        connector: CVPConnector,
+        device_id: str,
+        device: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        vni_updates = self._expand_child_map(
+            connector,
+            device_id,
+            self.paths['vxlan_vni']['path_elements'],
+        )
+
+        entries: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for raw_key, raw_value in vni_updates.items():
+            vlan_id = self._extract_scalar_from_key(raw_key).strip()
+            if not vlan_id:
+                continue
+
+            try:
+                if int(vlan_id) > 3800:
+                    continue
+            except ValueError:
+                continue
+
+            if not isinstance(raw_value, dict):
+                continue
+
+            vni = self._extract_nested_scalar(raw_value, 'vni').strip()
+            if not vni:
+                continue
+
+            dedupe_key = (vlan_id, vni)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            entries.append(
+                {
+                    'device_id': device_id,
+                    'hostname': device['hostname'],
+                    'vlan_id': vlan_id,
+                    'vni': vni,
+                    'source_path': '/' + '/'.join(str(item) for item in self.paths['vxlan_vni']['path_elements']),
+                    'cvp_source': self.source.name,
+                }
+            )
+        return entries
 
     def _collect_config(self, connector: CVPConnector, device_id: str) -> str:
         updates = connector.get_merged_updates(device_id, self.paths['config']['path_elements'])
@@ -302,3 +444,49 @@ class CVPCollectorSuite:
                 return raw_key
         return raw_key
 
+    def _extract_nested_scalar(self, raw_value: Any, field_name: str) -> str:
+        if isinstance(raw_value, dict):
+            direct = raw_value.get(field_name)
+            if direct is not None:
+                return self._coerce_scalar(direct)
+
+            for raw_key, value in raw_value.items():
+                normalized_key = str(raw_key).lower()
+                if normalized_key == field_name.lower() or normalized_key.endswith(field_name.lower()):
+                    extracted = self._coerce_scalar(value)
+                    if extracted:
+                        return extracted
+
+            for value in raw_value.values():
+                extracted = self._extract_nested_scalar(value, field_name)
+                if extracted:
+                    return extracted
+
+        if isinstance(raw_value, list):
+            for item in raw_value:
+                extracted = self._extract_nested_scalar(item, field_name)
+                if extracted:
+                    return extracted
+
+        return ''
+
+    def _coerce_scalar(self, raw_value: Any) -> str:
+        if isinstance(raw_value, dict):
+            if 'value' in raw_value and not isinstance(raw_value['value'], (dict, list)):
+                return str(raw_value['value'])
+            for value in raw_value.values():
+                extracted = self._coerce_scalar(value)
+                if extracted:
+                    return extracted
+            return ''
+
+        if isinstance(raw_value, list):
+            for item in raw_value:
+                extracted = self._coerce_scalar(item)
+                if extracted:
+                    return extracted
+            return ''
+
+        if raw_value in {None, ''}:
+            return ''
+        return str(raw_value)
